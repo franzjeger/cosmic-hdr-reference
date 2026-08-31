@@ -1,0 +1,229 @@
+diff --git a/cosmic-settings/src/pages/display/mod.rs b/cosmic-settings/src/pages/display/mod.rs
+index 1480c19..c29177f 100644
+--- a/cosmic-settings/src/pages/display/mod.rs
++++ b/cosmic-settings/src/pages/display/mod.rs
+@@ -16,6 +16,7 @@ use cosmic::{Apply, Element, Task, surface};
+ use cosmic_randr_shell::{
+     AdaptiveSyncAvailability, AdaptiveSyncState, List, Output, OutputKey, Transform,
+ };
++use cosmic_config::{ConfigGet, ConfigSet};
+ use cosmic_settings_page::{self as page, Section, section};
+ use futures::SinkExt;
+ use indexmap::Equivalent;
+@@ -28,6 +29,97 @@ use tokio::sync::oneshot;
+ 
+ static DPI_SCALES: &[u32] = &[50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300];
+ 
++/// Mirror of the compositor's published per-output HDR status
++/// (cosmic-config state `com.system76.CosmicComp/v1` key `hdr_outputs`).
++#[derive(Clone, Copy, Debug, serde::Deserialize)]
++struct HdrOutputStatus {
++    max_luminance: u16,
++    reference_white: u16,
++    active: bool,
++    #[serde(default)]
++    capable: bool,
++}
++
++/// Per-display HDR state for the settings widgets. Carries the connector name
++/// it was read for, so a write can never target another display through a
++/// stale output key after the display list was rebuilt.
++#[derive(Clone, Debug)]
++struct HdrUiState {
++    connector: String,
++    value: u16,
++    max: u16,
++    active: bool,
++    tearing: bool,
++}
++
++/// Reads one connector's HDR status (capability, activity, brightness) and
++/// tearing preference. `None` when the panel cannot do HDR at all; tearing is
++/// shown regardless through the caller.
++fn hdr_ui_state_for(connector: &str) -> Option<HdrUiState> {
++    // The published status file outlives sessions; only offer the controls
++    // when the running compositor actually honors the keys they write.
++    // (The HDR session exports this; drop the check once the HDR build is
++    // the default COSMIC session and the capability is detected via the
++    // wp_tearing_control/color-management globals instead.)
++    if std::env::var_os("COSMIC_HDR_SESSION").is_none() {
++        return None;
++    }
++    let state = cosmic_config::Config::new_state("com.system76.CosmicComp", 1).ok()?;
++    let status = state
++        .get::<std::collections::HashMap<String, HdrOutputStatus>>("hdr_outputs")
++        .ok()?;
++    let info = status.get(connector)?;
++    if !(info.capable || info.active) {
++        return None;
++    }
++    Some(HdrUiState {
++        connector: connector.to_owned(),
++        value: info.reference_white.max(80),
++        max: info.max_luminance.max(80),
++        active: info.active,
++        tearing: tearing_allowed_for(connector),
++    })
++}
++
++fn tearing_allowed_for(connector: &str) -> bool {
++    let Ok(config) = cosmic_config::Config::new("com.system76.CosmicComp", 1) else {
++        return true;
++    };
++    config
++        .get::<std::collections::HashMap<String, bool>>("allow_tearing_outputs")
++        .ok()
++        .and_then(|map| map.get(connector).copied())
++        .unwrap_or_else(|| config.get::<bool>("allow_tearing").unwrap_or(true))
++}
++
++fn set_bool_map_entry(key: &'static str, connector: &str, value: bool) {
++    let Ok(config) = cosmic_config::Config::new("com.system76.CosmicComp", 1) else {
++        return;
++    };
++    let mut map = config
++        .get::<std::collections::HashMap<String, bool>>(key)
++        .unwrap_or_default();
++    map.insert(connector.to_owned(), value);
++    if let Err(why) = config.set(key, map) {
++        tracing::error!(?why, key, "failed to update per-display setting");
++    }
++}
++
++/// Writes one connector's HDR brightness into the live per-output config key
++/// the compositor watches.
++fn set_hdr_brightness(connector: &str, value: u16) {
++    let Ok(config) = cosmic_config::Config::new("com.system76.CosmicComp", 1) else {
++        return;
++    };
++    let mut map = config
++        .get::<std::collections::HashMap<String, u16>>("hdr_reference_white_outputs")
++        .unwrap_or_default();
++    map.insert(connector.to_owned(), value);
++    if let Err(why) = config.set("hdr_reference_white_outputs", map) {
++        tracing::error!(?why, "failed to set HDR brightness");
++    }
++}
++
+ static DPI_SCALE_LABELS: LazyLock<Vec<String>> =
+     LazyLock::new(|| DPI_SCALES.iter().map(|scale| format!("{scale}%")).collect());
+ 
+@@ -103,6 +195,12 @@ pub enum Message {
+     Scale(usize),
+     /// Adjust the display scale.
+     AdjustScale(u32),
++    /// Set the HDR "SDR brightness" (reference white) of a display, in cd/m².
++    HdrBrightness(u16),
++    /// Toggle HDR for the active display.
++    HdrEnable(bool),
++    /// Toggle tearing (uncapped frame rates) for the active display.
++    TearingToggle(bool),
+     /// Refreshes display outputs.
+     Update {
+         /// Available outputs from cosmic-randr.
+@@ -202,6 +300,8 @@ struct ViewCache {
+     vrr_selected: Option<usize>,
+     resolution_selected: Option<usize>,
+     scale_selected: Option<usize>,
++    /// HDR state for the active display, when the panel is HDR-capable.
++    hdr_brightness: Option<HdrUiState>,
+ }
+ 
+ impl page::AutoBind<crate::pages::Message> for Page {}
+@@ -630,6 +730,33 @@ impl Page {
+                 return self.set_scale(option);
+             }
+ 
++            Message::HdrBrightness(value) => {
++                if let Some(hdr) = self.cache.hdr_brightness.as_mut() {
++                    let value = value.clamp(80, hdr.max);
++                    if value != hdr.value {
++                        hdr.value = value;
++                        let connector = hdr.connector.clone();
++                        set_hdr_brightness(&connector, value);
++                    }
++                }
++            }
++
++            Message::HdrEnable(enable) => {
++                if let Some(hdr) = self.cache.hdr_brightness.as_mut() {
++                    hdr.active = enable;
++                    let connector = hdr.connector.clone();
++                    set_bool_map_entry("hdr_enabled_outputs", &connector, enable);
++                }
++            }
++
++            Message::TearingToggle(allow) => {
++                if let Some(hdr) = self.cache.hdr_brightness.as_mut() {
++                    hdr.tearing = allow;
++                    let connector = hdr.connector.clone();
++                    set_bool_map_entry("allow_tearing_outputs", &connector, allow);
++                }
++            }
++
+             Message::AdjustScale(scale) => {
+                 if self.adjusted_scale != scale {
+                     self.adjusted_scale = scale;
+@@ -780,6 +907,7 @@ impl Page {
+         self.cache.resolution_selected = None;
+         self.cache.refresh_rate_selected = None;
+         self.cache.vrr_selected = None;
++        self.cache.hdr_brightness = hdr_ui_state_for(&output.name);
+ 
+         let selected_scale = DPI_SCALES
+             .iter()
+@@ -1248,6 +1376,9 @@ pub fn display_configuration() -> Section<crate::pages::Message> {
+         enable_label = fl!("display", "enable");
+         options_label = fl!("display", "options");
+         mirroring_label = fl!("mirroring");
++        hdr_brightness_label = fl!("display", "hdr-brightness");
++        hdr_label = fl!("display", "hdr");
++        hdr_tearing_label = fl!("display", "hdr-tearing");
+     });
+ 
+     Section::default()
+@@ -1355,6 +1486,30 @@ pub fn display_configuration() -> Section<crate::pages::Message> {
+                     ),
+                 ]);
+ 
++                if let Some(hdr) = &page.cache.hdr_brightness {
++                    items.push(widget::settings::item(
++                        &descriptions[hdr_label],
++                        widget::toggler(hdr.active).on_toggle(Message::HdrEnable),
++                    ));
++                    if hdr.active {
++                        items.push(widget::settings::item(
++                            &descriptions[hdr_brightness_label],
++                            widget::row::with_capacity(2)
++                                .spacing(cosmic::theme::spacing().space_xs)
++                                .align_y(Alignment::Center)
++                                .push(
++                                    widget::slider(80..=hdr.max, hdr.value, Message::HdrBrightness)
++                                        .width(Length::Fixed(220.0)),
++                                )
++                                .push(text::body(format!("{} cd/m²", hdr.value))),
++                        ));
++                    }
++                    items.push(widget::settings::item(
++                        &descriptions[hdr_tearing_label],
++                        widget::toggler(hdr.tearing).on_toggle(Message::TearingToggle),
++                    ));
++                }
++
+                 items
+             });
+ 
+diff --git a/i18n/en/cosmic_settings.ftl b/i18n/en/cosmic_settings.ftl
+index 860d19d..8ec46bf 100644
+--- a/i18n/en/cosmic_settings.ftl
++++ b/i18n/en/cosmic_settings.ftl
+@@ -568,6 +568,9 @@ display = Displays
+     .resolution = Resolution
+     .scale = Scale
+     .additional-scale-options = Additional scale options
++    .hdr-brightness = HDR brightness (SDR white)
++    .hdr = HDR
++    .hdr-tearing = Allow tearing (uncapped frame rates)
+ 
+ mirroring = Mirroring
+     .id = Mirroring { $id }

@@ -1,0 +1,19 @@
+# Build output
+/cosmic-comp/target/
+/smithay/target/
+
+# Read-only/reference clones used during development
+/cosmic-comp-hdr-experiment/
+/smithay-hdr-experiment/
+/smithay-hdr/
+/niri/
+/niri-hdr/
+
+# Superseded planning artifact
+/CODEX_HDR_IMPLEMENTATION_PROMPT.md
+
+# Isolated session runtime state
+/test-session/state/
+
+# Patched fork checkout (own git repo); the patch itself lives in /patches
+/cosmic-settings/
