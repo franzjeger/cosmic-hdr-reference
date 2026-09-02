@@ -41,7 +41,11 @@ Validated on 2026-08-31 with:
   - 3440x1440 up to 240 Hz
   - 3840x2160 up to 240 Hz
 
-The implementation has not yet been validated on AMD or Intel hardware.
+AMD validation was completed on 2026-09-02 with a Rembrandt Radeon 680M and
+an LG HDR television over HDMI. The bring-up exposed an optional CTA luminance
+handling issue and a strict-startup teardown deadlock. The focused fix and
+analysis are in `patches/cosmic-comp-amd-hdr-startup.patch` and
+`docs/amd-hdr-bringup.md`. Intel remains unvalidated.
 
 ## Current architecture and limitations
 
@@ -67,6 +71,8 @@ can re-enable eligible primary-plane scanout.
 - `smithay/` - atomic DRM color state, Wayland color-management support, HDR
   image descriptions, renderer hooks, and asynchronous page-flip support.
 - `patches/` - companion COSMIC Settings patch.
+- `docs/amd-hdr-bringup.md` - AMD failure analysis, validated hardware, and
+  upstreaming guidance.
 
 Imported source revisions recorded by the integration project:
 

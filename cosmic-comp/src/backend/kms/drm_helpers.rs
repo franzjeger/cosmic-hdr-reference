@@ -327,7 +327,8 @@ pub fn hdr_max_bpc_value(range: Option<&RangeInclusive<u32>>) -> Option<Option<u
 }
 
 /// Returns usable HDR10 capabilities when the EDID advertises Static Metadata
-/// Type 1, PQ and BT.2020 RGB signaling with a non-zero desired peak.
+/// Type 1, PQ and BT.2020 RGB signaling. CTA permits sinks to omit the
+/// optional luminance bytes; use a conservative internal ceiling in that case.
 pub fn hdr_sink_capabilities(info: &Info) -> Option<HdrSinkCapabilities> {
     hdr_sink_capabilities_from_edid(
         info.hdr_static_metadata(),
@@ -347,10 +348,12 @@ fn hdr_sink_capabilities_from_edid(
         value.round().clamp(0.0, u16::MAX as f32) as u16
     }
 
-    let max_luminance = rounded_u16(metadata.desired_content_max_luminance);
-    if max_luminance == 0 {
-        return None;
-    }
+    let reported_max_luminance = rounded_u16(metadata.desired_content_max_luminance);
+    let max_luminance = if reported_max_luminance == 0 {
+        1_000
+    } else {
+        reported_max_luminance
+    };
     let reported_frame_average = rounded_u16(metadata.desired_content_max_frame_avg_luminance);
     let max_frame_average_luminance = if reported_frame_average == 0 {
         max_luminance

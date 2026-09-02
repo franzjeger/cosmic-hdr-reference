@@ -1,0 +1,67 @@
+diff --git a/cosmic-comp/src/backend/kms/drm_helpers.rs b/cosmic-comp/src/backend/kms/drm_helpers.rs
+index 64af528..d68d18d 100644
+--- a/cosmic-comp/src/backend/kms/drm_helpers.rs
++++ b/cosmic-comp/src/backend/kms/drm_helpers.rs
+@@ -327,7 +327,8 @@ pub fn hdr_max_bpc_value(range: Option<&RangeInclusive<u32>>) -> Option<Option<u
+ }
+ 
+ /// Returns usable HDR10 capabilities when the EDID advertises Static Metadata
+-/// Type 1, PQ and BT.2020 RGB signaling with a non-zero desired peak.
++/// Type 1, PQ and BT.2020 RGB signaling. CTA permits sinks to omit the
++/// optional luminance bytes; use a conservative internal ceiling in that case.
+ pub fn hdr_sink_capabilities(info: &Info) -> Option<HdrSinkCapabilities> {
+     hdr_sink_capabilities_from_edid(
+         info.hdr_static_metadata(),
+@@ -347,10 +348,12 @@ fn hdr_sink_capabilities_from_edid(
+         value.round().clamp(0.0, u16::MAX as f32) as u16
+     }
+ 
+-    let max_luminance = rounded_u16(metadata.desired_content_max_luminance);
+-    if max_luminance == 0 {
+-        return None;
+-    }
++    let reported_max_luminance = rounded_u16(metadata.desired_content_max_luminance);
++    let max_luminance = if reported_max_luminance == 0 {
++        1_000
++    } else {
++        reported_max_luminance
++    };
+     let reported_frame_average = rounded_u16(metadata.desired_content_max_frame_avg_luminance);
+     let max_frame_average_luminance = if reported_frame_average == 0 {
+         max_luminance
+diff --git a/cosmic-comp/src/backend/kms/mod.rs b/cosmic-comp/src/backend/kms/mod.rs
+index 6b3a025..b9864f6 100644
+--- a/cosmic-comp/src/backend/kms/mod.rs
++++ b/cosmic-comp/src/backend/kms/mod.rs
+@@ -1314,10 +1314,13 @@ impl KmsGuard<'_> {
+                                         }
+                                         Err(err) => {
+                                             if hdr_policy.require_active && hdr_primary {
+-                                                return Err(anyhow::anyhow!(
++                                                let failure = anyhow::anyhow!(
+                                                     "required HDR atomic TEST_ONLY validation failed for {}: {err}",
+                                                     surface.output.name()
+-                                                ));
++                                                );
++                                                std::mem::drop(compositor_ref);
++                                                std::mem::forget(compositor);
++                                                return Err(failure);
+                                             }
+                                             warn!(
+                                                 output = %surface.output.name(),
+@@ -1329,10 +1332,13 @@ impl KmsGuard<'_> {
+                                 }
+                                 _ => {
+                                     if hdr_policy.require_active && hdr_primary {
+-                                        return Err(anyhow::anyhow!(
++                                        let failure = anyhow::anyhow!(
+                                             "required 10-bit/PQ/BT.2020 path is unavailable for {} (format={format:?}, capabilities={hdr_capabilities:?}, colorspaces={colorspaces:?}, metadata={metadata_supported:?}, bpc={bpc_range:?})",
+                                             surface.output.name()
+-                                        ));
++                                        );
++                                        std::mem::drop(compositor_ref);
++                                        std::mem::forget(compositor);
++                                        return Err(failure);
+                                     }
+                                     warn!(
+                                         output = %surface.output.name(),

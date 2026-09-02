@@ -1314,10 +1314,13 @@ impl KmsGuard<'_> {
                                         }
                                         Err(err) => {
                                             if hdr_policy.require_active && hdr_primary {
-                                                return Err(anyhow::anyhow!(
+                                                let failure = anyhow::anyhow!(
                                                     "required HDR atomic TEST_ONLY validation failed for {}: {err}",
                                                     surface.output.name()
-                                                ));
+                                                );
+                                                std::mem::drop(compositor_ref);
+                                                std::mem::forget(compositor);
+                                                return Err(failure);
                                             }
                                             warn!(
                                                 output = %surface.output.name(),
@@ -1329,10 +1332,13 @@ impl KmsGuard<'_> {
                                 }
                                 _ => {
                                     if hdr_policy.require_active && hdr_primary {
-                                        return Err(anyhow::anyhow!(
+                                        let failure = anyhow::anyhow!(
                                             "required 10-bit/PQ/BT.2020 path is unavailable for {} (format={format:?}, capabilities={hdr_capabilities:?}, colorspaces={colorspaces:?}, metadata={metadata_supported:?}, bpc={bpc_range:?})",
                                             surface.output.name()
-                                        ));
+                                        );
+                                        std::mem::drop(compositor_ref);
+                                        std::mem::forget(compositor);
+                                        return Err(failure);
                                     }
                                     warn!(
                                         output = %surface.output.name(),
