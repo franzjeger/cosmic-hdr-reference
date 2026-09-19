@@ -1,5 +1,9 @@
 # COSMIC HDR reference implementation
 
+## Project Status
+**Active Development** — This project is currently being maintained and updated.
+
+
 Hardware-validated reference implementation of HDR output and HDR client
 presentation for the COSMIC compositor and its Smithay backend.
 
