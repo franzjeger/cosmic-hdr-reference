@@ -403,6 +403,76 @@ pub fn get_property_val(
 }
 
 // Returns refresh rate in milliherz
+/// Builds CVT reduced-blanking (v1) timings for an arbitrary size.
+///
+/// Virtual connectors (vkms) only list the VESA DMT modes, which miss common
+/// sizes such as 2560x1440 or 3440x1440, but accept any timings in an atomic
+/// commit. This lets output management (e.g. a remote desktop server matching
+/// the size of its client window) use custom modes on them.
+pub fn cvt_reduced_blanking_mode(width: i32, height: i32, refresh_mhz: u32) -> Option<Mode> {
+    const H_BLANK: u32 = 160;
+    const H_FRONT_PORCH: u32 = 48;
+    const H_SYNC: u32 = 32;
+    const V_FRONT_PORCH: u32 = 3;
+    const MIN_V_BACK_PORCH: u32 = 6;
+    const MIN_V_BLANK_US: f64 = 460.0;
+
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let (h, v) = (width as u32, height as u32);
+    let refresh = f64::from(refresh_mhz.max(1_000)) / 1000.0;
+    // Vertical sync width encodes the aspect ratio in CVT.
+    let v_sync = if h * 3 == v * 4 {
+        4
+    } else if h * 9 == v * 16 {
+        5
+    } else if h * 10 == v * 16 {
+        6
+    } else if h * 4 == v * 5 || h * 9 == v * 15 {
+        7
+    } else {
+        10
+    };
+    let h_period_us = (1_000_000.0 / refresh - MIN_V_BLANK_US) / f64::from(v);
+    if h_period_us <= 0.0 {
+        return None;
+    }
+    let v_blank = ((MIN_V_BLANK_US / h_period_us) as u32 + 1)
+        .max(V_FRONT_PORCH + v_sync + MIN_V_BACK_PORCH);
+    let h_total = h + H_BLANK;
+    let v_total = v + v_blank;
+    if h_total > u32::from(u16::MAX) || v_total > u32::from(u16::MAX) {
+        return None;
+    }
+    // Pixel clock in kHz, in 0.25 MHz steps.
+    let clock = ((refresh * f64::from(h_total) * f64::from(v_total) / 1000.0 / 250.0).floor()
+        as u32)
+        * 250;
+
+    let mut name = [0 as std::ffi::c_char; 32];
+    for (dst, src) in name.iter_mut().zip(format!("{h}x{v}").bytes().take(31)) {
+        *dst = src as std::ffi::c_char;
+    }
+    Some(Mode::from(drm_ffi::drm_mode_modeinfo {
+        clock,
+        hdisplay: h as u16,
+        hsync_start: (h + H_FRONT_PORCH) as u16,
+        hsync_end: (h + H_FRONT_PORCH + H_SYNC) as u16,
+        htotal: h_total as u16,
+        hskew: 0,
+        vdisplay: v as u16,
+        vsync_start: (v + V_FRONT_PORCH) as u16,
+        vsync_end: (v + V_FRONT_PORCH + v_sync) as u16,
+        vtotal: v_total as u16,
+        vscan: 0,
+        vrefresh: refresh.round() as u32,
+        flags: drm_ffi::DRM_MODE_FLAG_PHSYNC | drm_ffi::DRM_MODE_FLAG_NVSYNC,
+        type_: drm_ffi::DRM_MODE_TYPE_USERDEF,
+        name,
+    }))
+}
+
 pub fn calculate_refresh_rate(mode: Mode) -> u32 {
     let htotal = mode.hsync().2 as u32;
     let vtotal = mode.vsync().2 as u32;
@@ -591,5 +661,33 @@ mod hdr_tests {
 
         state.commit();
         assert_eq!(state.get(), Some(active));
+    }
+}
+
+#[cfg(test)]
+mod cvt_tests {
+    use super::*;
+
+    #[test]
+    fn cvt_rb_matches_vesa_1080p() {
+        // VESA CVT-RB 1920x1080@60: 138.5 MHz, 2080x1111 total.
+        let mode = cvt_reduced_blanking_mode(1920, 1080, 60_000).unwrap();
+        assert_eq!(mode.clock(), 138_500);
+        assert_eq!(mode.hsync().2, 2080);
+        assert_eq!(mode.vsync().2, 1111);
+        assert_eq!(mode.size(), (1920, 1080));
+    }
+
+    #[test]
+    fn cvt_rb_ultrawide_round_trips_refresh() {
+        let mode = cvt_reduced_blanking_mode(3440, 1440, 60_000).unwrap();
+        assert_eq!(mode.size(), (3440, 1440));
+        let refresh = calculate_refresh_rate(mode);
+        assert!((59_500..=60_500).contains(&refresh), "{refresh}");
+    }
+
+    #[test]
+    fn cvt_rb_rejects_nonsense() {
+        assert!(cvt_reduced_blanking_mode(0, 1080, 60_000).is_none());
     }
 }

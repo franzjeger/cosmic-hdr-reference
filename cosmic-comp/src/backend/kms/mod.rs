@@ -1156,20 +1156,38 @@ impl KmsGuard<'_> {
                     .and_then(drm_helpers::hdr_sink_capabilities);
                 surface.hdr_sink_capabilities = hdr_capabilities;
                 let conn_info = drm.device().get_connector(conn, false)?;
+                let wanted_size = output_config.mode_size();
+                // Custom modes from output management may come without a refresh rate.
+                let wanted_refresh = output_config.0.mode.1.unwrap_or(60_000);
                 let mode = conn_info
                     .modes()
                     .iter()
                     // match the size
                     .filter(|mode| {
                         let (x, y) = mode.size();
-                        Size::from((x as i32, y as i32)) == output_config.mode_size()
+                        Size::from((x as i32, y as i32)) == wanted_size
                     })
                     // and then select the closest refresh rate (e.g. to match 59.98 as 60)
                     .min_by_key(|mode| {
                         let refresh_rate = drm_helpers::calculate_refresh_rate(**mode);
-                        (output_config.0.mode.1.unwrap() as i32 - refresh_rate as i32).abs()
+                        (wanted_refresh as i32 - refresh_rate as i32).abs()
+                    })
+                    .copied()
+                    .or_else(|| {
+                        // Virtual connectors (vkms) take any timings; generate
+                        // them for sizes missing from their fixed mode list.
+                        (conn_info.interface() == Interface::Virtual)
+                            .then(|| {
+                                drm_helpers::cvt_reduced_blanking_mode(
+                                    wanted_size.w,
+                                    wanted_size.h,
+                                    wanted_refresh,
+                                )
+                            })
+                            .flatten()
                     })
                     .ok_or(anyhow::anyhow!("Unable to find matching mode"))?;
+                let mode = &mode;
                 std::mem::drop(output_config);
 
                 if !test_only {

@@ -794,6 +794,7 @@ dependencies = [
  "cosmic-settings-config",
  "cosmic-settings-daemon-config",
  "cosmic-text",
+ "drm-ffi 0.9.1",
  "egui",
  "egui_plot",
  "futures-executor",
