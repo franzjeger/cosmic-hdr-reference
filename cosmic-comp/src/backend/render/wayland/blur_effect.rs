@@ -462,9 +462,20 @@ where
         let texture_ref = texture.lock().unwrap();
 
         if let Some(tex) = texture_ref.as_ref() {
-            BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                .override_default_tex_program(self.render_shader.clone(), self.uniforms.clone());
-            frame.render_texture_from_to(
+            // Restore the frame's override afterwards: it tells later elements
+            // whether the frame is HDR client passthrough.
+            let saved = {
+                let gles = BorrowMut::<GlesFrame>::borrow_mut(
+                    <R as AsGlowRenderer>::glow_frame_mut(frame),
+                );
+                let saved = gles.take_tex_program_override();
+                gles.override_default_tex_program(
+                    self.render_shader.clone(),
+                    self.uniforms.clone(),
+                );
+                saved
+            };
+            let result = frame.render_texture_from_to(
                 tex,
                 src,
                 dst,
@@ -472,9 +483,10 @@ where
                 opaque_regions,
                 Transform::Normal,
                 1.0,
-            )?;
+            );
             BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-                .clear_tex_program_override();
+                .set_tex_program_override(saved);
+            result?;
         }
         Ok(())
     }

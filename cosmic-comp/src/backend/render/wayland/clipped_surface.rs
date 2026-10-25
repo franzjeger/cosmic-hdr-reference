@@ -17,7 +17,10 @@ use smithay::{
     utils::user_data::UserDataMap,
 };
 
-use crate::backend::render::element::AsGlowRenderer;
+use crate::backend::render::{
+    element::AsGlowRenderer,
+    wayland::hdr_surface::{HdrContentShader, HdrSurfaceContent},
+};
 
 pub static CLIPPING_SHADER: &str = include_str!("../shaders/clipped_surface.frag");
 pub struct ClippingShader(pub GlesTexProgram);
@@ -41,6 +44,9 @@ pub struct ClippedSurfaceRenderElement<R: Renderer> {
     radius: [u8; 4],
     geometry: Rectangle<f64, Logical>,
     uniforms: Vec<Uniform<'static>>,
+    /// Clips and decodes an HDR buffer for frames that composite in SDR
+    /// encoding; see `HdrSurfaceRenderElement`.
+    hdr_program: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
 }
 
 impl<R> ClippedSurfaceRenderElement<R>
@@ -53,6 +59,7 @@ where
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
         radius: [u8; 4],
+        hdr_content: Option<HdrSurfaceContent>,
     ) -> Self
     where
         R: AsGlowRenderer,
@@ -94,7 +101,7 @@ where
             transform_matrix * geo_scale * geo_translation * buf_scale * buf_translation,
         );
 
-        let uniforms = vec![
+        let mut uniforms = vec![
             Uniform::new("geo_size", (geometry.size.w as f32, geometry.size.h as f32)),
             Uniform::new(
                 "corner_radius",
@@ -112,8 +119,13 @@ where
                     transpose: false,
                 },
             ),
-            Uniform::new("noise", UniformValue::_1f(0.0)),
         ];
+        let hdr_program = hdr_content.map(|content| {
+            let mut uniforms = uniforms.clone();
+            uniforms.extend(content.sdr_uniforms());
+            (HdrContentShader::get(renderer).clipped.clone(), uniforms)
+        });
+        uniforms.push(Uniform::new("noise", UniformValue::_1f(0.0)));
 
         Self {
             inner: elem,
@@ -121,6 +133,7 @@ where
             radius,
             geometry,
             uniforms,
+            hdr_program,
         }
     }
 
@@ -259,13 +272,22 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
+        let gles = BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame));
+        // Restore the frame's override afterwards: it tells later elements
+        // whether the frame is HDR client passthrough. HDR buffers keep the
+        // plain clip in that case.
+        let saved = gles.take_tex_program_override();
+        let program = match (&self.hdr_program, &saved) {
+            (Some(hdr_program), None) => hdr_program.clone(),
+            _ => (self.program.clone(), self.uniforms.clone()),
+        };
+        gles.set_tex_program_override(Some(program));
+        let result = self
+            .inner
+            .draw(frame, src, dst, damage, opaque_regions, cache);
         BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-            .override_default_tex_program(self.program.clone(), self.uniforms.clone());
-        self.inner
-            .draw(frame, src, dst, damage, opaque_regions, cache)?;
-        BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
-            .clear_tex_program_override();
-        Ok(())
+            .set_tex_program_override(saved);
+        result
     }
 
     fn underlying_storage(&self, _renderer: &mut R) -> Option<UnderlyingStorage<'_>> {

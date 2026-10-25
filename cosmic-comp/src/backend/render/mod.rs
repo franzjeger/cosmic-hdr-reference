@@ -4,6 +4,7 @@ use std::{
     borrow::{Borrow, BorrowMut},
     cell::RefCell,
     collections::HashMap,
+    ffi::CStr,
     ops::ControlFlow,
     sync::{Arc, Weak},
     time::Instant,
@@ -21,6 +22,7 @@ use crate::{
                 SurfaceRenderElement,
                 blur_effect::BlurShaders,
                 clipped_surface::{CLIPPING_SHADER, ClippingShader},
+                hdr_surface::HdrContentShader,
                 push_render_elements_from_surface_tree,
             },
         },
@@ -69,6 +71,7 @@ use smithay::{
                 GlesError, GlesPixelProgram, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
                 UniformName, UniformType,
                 element::{PixelShaderElement, TextureShaderElement},
+                ffi,
             },
             glow::GlowRenderer,
             multigpu::{Error as MultiError, MultiFrame, MultiRenderer},
@@ -108,15 +111,18 @@ static HDR_SDR_TEXTURE_SHADER: &str = include_str!("shaders/hdr_sdr_texture.frag
 pub struct HdrSdrTextureShader(pub GlesTexProgram);
 
 /// CPU mirror of `decode_sdr` in the HDR shaders: `gamma == 0.0` is the
-/// piecewise sRGB curve, anything else a pure power law.
+/// piecewise sRGB curve, anything else a pure power law, both extended to
+/// negative values by odd symmetry.
 fn decode_sdr(value: f32, gamma: f32) -> f32 {
-    if gamma > 0.0 {
-        value.max(0.0).powf(gamma)
-    } else if value <= 0.04045 {
-        value / 12.92
+    let magnitude = value.abs();
+    let linear = if gamma > 0.0 {
+        magnitude.powf(gamma)
+    } else if magnitude <= 0.04045 {
+        magnitude / 12.92
     } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
+        ((magnitude + 0.055) / 1.055).powf(2.4)
+    };
+    linear.copysign(value)
 }
 
 fn srgb_color_to_pq(color: Color32F, reference_white: f32) -> Color32F {
@@ -484,6 +490,39 @@ impl BackdropShader {
 
 pub struct PostprocessShader(pub GlesTexProgram);
 
+/// Present when the renderer can render to, and blend into, half-float
+/// textures; see [`postprocess_intermediate_format`].
+struct HalfFloatRenderTarget;
+
+/// Half-float color buffers are core in GLES 3.2. Earlier GLES 3 contexts need
+/// `EXT_color_buffer_half_float` or `EXT_color_buffer_float`; smithay does
+/// not allocate half-float textures on GLES 2 at all.
+fn gles_supports_half_float_render_target(version: &str, extensions: &str) -> bool {
+    let Some((major, minor)) = version
+        .strip_prefix("OpenGL ES ")
+        .and_then(|version| version.split_whitespace().next())
+        .and_then(|version| version.split_once('.'))
+        .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
+    else {
+        return false;
+    };
+    (major, minor) >= (3, 2)
+        || (major >= 3
+            && extensions.split_whitespace().any(|extension| {
+                extension == "GL_EXT_color_buffer_half_float"
+                    || extension == "GL_EXT_color_buffer_float"
+            }))
+}
+
+/// Whether [`init_shaders`] found half-float render targets usable.
+pub fn supports_half_float_render_target(renderer: &GlesRenderer) -> bool {
+    renderer
+        .egl_context()
+        .user_data()
+        .get::<HalfFloatRenderTarget>()
+        .is_some()
+}
+
 pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     {
         let egl_context = renderer.egl_context();
@@ -532,6 +571,7 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
             UniformName::new("hdr_content_reference", UniformType::_1f),
         ],
     )?;
+    let hdr_content_shader = HdrContentShader::compile(renderer)?;
     let clipping_shader = renderer.compile_custom_texture_shader(
         CLIPPING_SHADER,
         &[
@@ -555,6 +595,21 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         ],
     )?;
     let blur_shaders = BlurShaders::compile(renderer)?;
+    let half_float = renderer.with_context(|gl| {
+        let string = |name| {
+            // SAFETY: the context is current, and GetString returns either
+            // null or a static NUL-terminated string.
+            let ptr = unsafe { gl.GetString(name) };
+            if ptr.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(ptr.cast()) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        gles_supports_half_float_render_target(&string(ffi::VERSION), &string(ffi::EXTENSIONS))
+    })?;
 
     let egl_context = renderer.egl_context();
     egl_context
@@ -569,6 +624,14 @@ pub fn init_shaders(renderer: &mut GlesRenderer) -> Result<(), GlesError> {
     egl_context
         .user_data()
         .insert_if_missing(|| HdrSdrTextureShader(hdr_sdr_texture_shader));
+    egl_context
+        .user_data()
+        .insert_if_missing(|| hdr_content_shader);
+    if half_float {
+        egl_context
+            .user_data()
+            .insert_if_missing(|| HalfFloatRenderTarget);
+    }
     egl_context
         .user_data()
         .insert_if_missing(|| ClippingShader(clipping_shader));
@@ -1235,15 +1298,28 @@ pub struct PostprocessState {
     pub output_config: PostprocessOutputConfig,
 }
 
-/// Pick the SDR render target that feeds the HDR post-processing shader.
+/// Pick the render target that feeds the HDR post-processing shader.
 ///
-/// A ten-bit scanout format does not imply that rendering to and sampling an
-/// offscreen texture with that format is reliable. The compositor contents at
-/// this point are still sRGB, so use the matching, widely-supported eight-bit
-/// channel layout and let the final shader write PQ into the ten-bit scanout FB.
-pub fn postprocess_intermediate_format(output_format: Fourcc, hdr_enabled: bool) -> Fourcc {
+/// HDR outputs composite in SDR encoding (Rec.709, the SDR transfer, 1.0 at
+/// reference white) extended beyond [0, 1]: windowed HDR content is stored as
+/// highlights above 1.0 and negative wide-gamut components, which only a
+/// half-float target keeps. SDR content and blending are the same either way.
+///
+/// Without half-float rendering, use the eight-bit layout matching the
+/// scanout channel order; HDR content then clips at reference white. A ten-bit
+/// scanout format does not imply that rendering to and sampling an offscreen
+/// texture with that format is reliable, and the final shader writes PQ into
+/// the ten-bit scanout FB anyway.
+pub fn postprocess_intermediate_format(
+    output_format: Fourcc,
+    hdr_enabled: bool,
+    half_float: bool,
+) -> Fourcc {
     if !hdr_enabled {
         return output_format;
+    }
+    if half_float {
+        return Fourcc::Abgr16161616f;
     }
 
     match output_format {

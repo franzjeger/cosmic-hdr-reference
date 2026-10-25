@@ -45,13 +45,35 @@ const mat3 rec709_to_bt2020 = mat3(
     0.0433136, 0.0113612, 0.8955950
 );
 
+// Both curves are extended by odd symmetry: the desktop intermediate of an HDR
+// output stores windowed HDR content as values above 1.0 (highlights) and
+// below 0.0 (colors outside Rec.709), and those must survive a round trip.
+// Values in [0, 1] are unaffected.
 float decode_sdr(float value) {
+    float magnitude = abs(value);
+    float linear;
     if (hdr_sdr_gamma > 0.0) {
-        return pow(max(value, 0.0), hdr_sdr_gamma);
+        linear = pow(magnitude, hdr_sdr_gamma);
+    } else {
+        linear = magnitude <= 0.04045
+            ? magnitude / 12.92
+            : pow((magnitude + 0.055) / 1.055, 2.4);
     }
-    return value <= 0.04045
-        ? value / 12.92
-        : pow((value + 0.055) / 1.055, 2.4);
+    return sign(value) * linear;
+}
+
+// Inverse of decode_sdr.
+float encode_sdr(float value) {
+    float magnitude = abs(value);
+    float encoded;
+    if (hdr_sdr_gamma > 0.0) {
+        encoded = pow(magnitude, 1.0 / hdr_sdr_gamma);
+    } else {
+        encoded = magnitude <= 0.0031308
+            ? magnitude * 12.92
+            : 1.055 * pow(magnitude, 1.0 / 2.4) - 0.055;
+    }
+    return sign(value) * encoded;
 }
 
 // ST 2084 inverse EOTF: absolute luminance in the normalized 10000 cd/m^2

@@ -6,6 +6,7 @@ use crate::{
         PostprocessShader, PostprocessState,
         element::{CosmicElement, DamageElement},
         init_shaders, output_elements, postprocess_intermediate_format, set_hdr_client_blend,
+        supports_half_float_render_target,
     },
     config::ScreenFilter,
     shell::Shell,
@@ -1520,8 +1521,14 @@ impl SurfaceThreadState {
         let res = if let Some(source_output) = source_output {
             let offscreen_output_config =
                 PostprocessOutputConfig::for_output_untransformed(source_output);
+            // Rendering on another GPU copies the target between devices;
+            // keep that path on the established eight-bit formats.
+            let half_float = render_node == self.target_node
+                && supports_half_float_render_target(Borrow::<GlesRenderer>::borrow(
+                    renderer.as_ref(),
+                ));
             let intermediate_format =
-                postprocess_intermediate_format(compositor.format(), self.hdr_enabled);
+                postprocess_intermediate_format(compositor.format(), self.hdr_enabled, half_float);
             let postprocess_state = match self.postprocess_textures.entry(self.target_node) {
                 hash_map::Entry::Occupied(occupied) => {
                     let postprocess_state = occupied.into_mut();

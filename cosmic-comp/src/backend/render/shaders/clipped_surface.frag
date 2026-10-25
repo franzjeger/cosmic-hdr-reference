@@ -27,6 +27,9 @@ uniform vec4 corner_radius;
 uniform mat3 input_to_geo;
 uniform float noise;
 
+// BEGIN ROUNDED CORNERS
+// Shared with the clipped variant of hdr_content.frag; hdr_test_vectors keeps
+// the two copies identical.
 float rounding_alpha(vec2 coords, vec2 size) {
     vec2 center;
     float radius;
@@ -51,6 +54,7 @@ float rounding_alpha(vec2 coords, vec2 size) {
     float half_px = 0.5;
     return 1.0 - smoothstep(radius - half_px, radius + half_px, dist);
 }
+// END ROUNDED CORNERS
 
 float hash(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 727.727);
