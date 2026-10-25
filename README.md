@@ -51,6 +51,23 @@ handling issue and a strict-startup teardown deadlock. The focused fix and
 analysis are in `patches/cosmic-comp-amd-hdr-startup.patch` and
 `docs/amd-hdr-bringup.md`. Intel remains unvalidated.
 
+### Community reports
+
+Reported by users in
+[pop-os/cosmic-comp#1384](https://github.com/pop-os/cosmic-comp/issues/1384);
+not reproduced by the maintainer.
+
+- [AMD Granite Ridge iGPU](https://github.com/pop-os/cosmic-comp/issues/1384#issuecomment-5647661564)
+  (Ryzen 5 9600X, amdgpu), Mesa 26.2.2, Linux 7.2.4 (CachyOS), MSI MP341CQ at
+  3440x1440 100 Hz with VRR and HDR10. HDR and tearing control work through
+  the patched Settings. An Intel Arc B580 was installed but drove no display.
+- [NVIDIA RTX 4090](https://github.com/pop-os/cosmic-comp/issues/1384#issuecomment-6329409666),
+  open kernel modules 595.104.02 (older than the validated 610.57.04),
+  Pop!_OS 24.04, Linux 7.2.6, Samsung Odyssey Neo G9 at 5120x1440 in HDR next
+  to a rotated SDR display. Cyberpunk 2077 under GE-Proton runs in HDR10/PQ.
+  This report used a rebase onto newer cosmic-comp; see the upstream
+  revisions below.
+
 ## Current architecture and limitations
 
 The compositor renders the ordinary SDR desktop into an 8-bit intermediate,
@@ -68,6 +85,16 @@ Direct and overlay scanout are disabled while the desktop HDR post-process is
 active because those planes would bypass the shader. HDR client passthrough
 can re-enable eligible primary-plane scanout.
 
+Because of this, HDR clients that do not cover the output, such as a windowed
+Blender using a Windows-scRGB swapchain, are currently composited as SDR; see
+[#1](https://github.com/franzjeger/cosmic-hdr-reference/issues/1).
+
+## Client notes
+
+Proton games need the Wayland driver for HDR. Valve's Proton Experimental 11
+ignores `PROTON_ENABLE_WAYLAND` and `PROTON_ENABLE_HDR`, leaving the game on
+X11 with HDR unavailable; GE-Proton honors them.
+
 ## Layout
 
 - `cosmic-comp/` - COSMIC compositor integration, configuration, rendering,
@@ -78,12 +105,29 @@ can re-enable eligible primary-plane scanout.
 - `docs/amd-hdr-bringup.md` - AMD failure analysis, validated hardware, and
   upstreaming guidance.
 
-Imported source revisions recorded by the integration project:
+### Upstream revisions
 
-- cosmic-comp: `c20b1d400efd2e090b6d7a63bf4e3ee718d65711`
-- smithay: `360c2e35d87e4449e66c46fd2b309eda81e697a3`
+The snapshot is based on these public upstream commits:
+
+- cosmic-comp: `5c93094574b31800caaa27255caac4a7253f24ad`
+- smithay: `e3d461a057ba244d213a8498ec372b0799cca103`, the revision that
+  cosmic-comp commit pins
+
+Against them the snapshot adds 2692 and removes 63 lines in cosmic-comp, and
+adds 3808 and removes 32 lines in Smithay. The `c20b1d4` and `360c2e3`
+revisions listed here previously were local integration commits and were never
+published.
+
+A community rebase onto newer cosmic-comp, with a separate login-session setup,
+is available at
+[Liquidmasl/cosmic-comp `hdr`](https://github.com/Liquidmasl/cosmic-comp/tree/hdr)
+and [Liquidmasl/smithay `hdr`](https://github.com/Liquidmasl/smithay/tree/hdr).
 
 ## Build and test
+
+The system libdisplay-info must be 0.3 or newer, because the HDR code uses its
+0.3 API. Ubuntu 24.04 and Pop!_OS 24.04 ship 0.1.1, so build 0.3 from source
+there.
 
 ```sh
 cd cosmic-comp
