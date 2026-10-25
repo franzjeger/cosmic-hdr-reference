@@ -41,7 +41,6 @@ pub struct HdrPolicy {
     /// into a matte look when MaxCLL equals their own peak.
     pub metadata_luminance_from_panel: bool,
     pub safe_exit_grace: Duration,
-    pub teardown_timeout: Duration,
 }
 
 impl HdrPolicy {
@@ -119,12 +118,6 @@ impl HdrPolicy {
                 lookup("COSMIC_HDR_SAFE_EXIT_GRACE_MS"),
                 5_000,
                 1_000,
-                15_000,
-            )),
-            teardown_timeout: Duration::from_millis(bounded_ms(
-                lookup("COSMIC_HDR_TEARDOWN_TIMEOUT_MS"),
-                5_000,
-                100,
                 15_000,
             )),
         }
@@ -409,7 +402,6 @@ mod tests {
             ("COSMIC_HDR_GAMUT_STRETCH", "1.5"),
             ("COSMIC_HDR_METADATA_LUMINANCE", "Panel"),
             ("COSMIC_HDR_SAFE_EXIT_GRACE_MS", "10"),
-            ("COSMIC_HDR_TEARDOWN_TIMEOUT_MS", "30000"),
         ]);
         let policy = HdrPolicy::from_lookup(|name| values.get(name).map(ToString::to_string));
 
@@ -431,7 +423,6 @@ mod tests {
         assert_eq!(policy.gamut_stretch, 1.0);
         assert!(policy.metadata_luminance_from_panel);
         assert_eq!(policy.safe_exit_grace, Duration::from_millis(1_000));
-        assert_eq!(policy.teardown_timeout, Duration::from_millis(15_000));
     }
 
     #[test]
@@ -455,6 +446,5 @@ mod tests {
         assert_eq!(policy.gamut_stretch, 0.0);
         assert!(!policy.metadata_luminance_from_panel);
         assert_eq!(policy.safe_exit_grace, Duration::from_millis(5_000));
-        assert_eq!(policy.teardown_timeout, Duration::from_millis(5_000));
     }
 }

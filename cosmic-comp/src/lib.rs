@@ -10,7 +10,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use nix::sys::signal::{SigSet, Signal};
 use smithay::{
     reexports::{
-        calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
+        calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic},
         wayland_server::{Display, DisplayHandle},
     },
     wayland::socket::ListeningSocketSource,
@@ -112,26 +112,10 @@ impl State {
 }
 
 pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
-    // Block termination signals before logger, state, or renderer setup can
-    // create threads. A dedicated waiter below can stop surface threads even if
-    // the main event loop is wedged in a client or configuration callback.
-    let hdr_policy = utils::env::hdr_policy();
-    // Clean SIGTERM shutdown through the event loop restores persistent KMS
-    // color state before the greeter takes over - correct for every session,
-    // not just HDR test runs.
-    let hdr_shutdown_signals = {
-        let mut signals = SigSet::empty();
-        signals.add(Signal::SIGTERM);
-        signals.add(Signal::SIGINT);
-        signals.thread_block()?;
-        // cosmic-session SIGKILLs its direct child at logout, skipping cleanup.
-        // The launcher interposes a wrapper process as that child; parent death
-        // then delivers our ordinary SIGTERM shutdown instead.
-        if let Err(err) = nix::sys::prctl::set_pdeathsig(Signal::SIGTERM) {
-            warn!(?err, "failed to arm parent-death SIGTERM cleanup");
-        }
-        Some(signals)
-    };
+    // Termination signals are handled by `spawn_signal_thread`. Block them
+    // before any other thread exists, as threads inherit the signal mask.
+    let termination_signals = SigSet::from_iter([Signal::SIGTERM, Signal::SIGINT]);
+    termination_signals.thread_block()?;
 
     let raw_args = RawArgs::from_args();
     let mut cursor = raw_args.cursor();
@@ -199,41 +183,14 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         with_xwayland,
         kiosk_command,
     );
-    if let Some(hdr_shutdown_signals) = hdr_shutdown_signals {
-        let (signal_sender, signal_receiver) = calloop::channel::channel();
-        event_loop
-            .handle()
-            .insert_source(signal_receiver, |event, &mut (), state| {
-                let calloop::channel::Event::Msg(signal) = event else {
-                    return;
-                };
-                warn!(?signal, "ending experimental HDR session cleanly");
-                state.common.should_stop = true;
-                state.common.event_loop_signal.stop();
-                state.common.event_loop_signal.wakeup();
-            })
-            .map_err(|err| err.error)
-            .context("Failed to install experimental HDR shutdown signals")?;
-
-        std::thread::Builder::new()
-            .name("cosmic-hdr-shutdown".into())
-            .spawn(move || match hdr_shutdown_signals.wait() {
-                Ok(signal) => {
-                    // KMS cleanup starts immediately on the owning surface threads. The
-                    // main loop receives the same request for ordinary state teardown.
-                    backend::kms::emergency_shutdown_hdr_surfaces();
-                    let _ = signal_sender.send(signal);
-                }
-                Err(err) => error!(?err, "strict HDR signal waiter failed"),
-            })
-            .context("Failed to start experimental HDR shutdown waiter")?;
-    }
+    spawn_signal_thread(termination_signals, &event_loop.handle())?;
     // Set up the libei sender side before the backend spawns Xwayland.
     let ei_sender = libei::setup_ei(&event_loop.handle());
     state.common.dbus_state.set_ei_sender(ei_sender);
 
     // init backend
     if let Err(err) = backend::init_backend_auto(&display, &mut event_loop, &mut state) {
+        let hdr_policy = utils::env::hdr_policy();
         if hdr_policy.require_active {
             // cosmic-session restarts compositors that exit non-zero. A strict HDR
             // preflight failure must instead announce the Wayland environment and end
@@ -345,48 +302,16 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     // because the event loop has stopped; an unconditional join in Surface::Drop
     // would instead deadlock against apply_config_for_outputs.
     if let BackendData::Kms(kms) = &mut state.backend {
-        // Connector color properties are persistent KMS state regardless of how HDR
-        // was enabled. Stop every output while the device is active so surface drop can
-        // restore Colorspace=Default and HDR_OUTPUT_METADATA=0.
-        let mut surface_threads = Vec::new();
-        for device in kms.drm_devices.values_mut() {
-            for (_, surface) in device.inner.surfaces.drain() {
-                let name = surface.output.name();
-                if let Some(thread) = surface.begin_shutdown() {
-                    surface_threads.push((name, thread));
-                }
-            }
-        }
-
-        // A wedged driver must not turn compositor shutdown into an unbounded hang.
-        // All surfaces share this deadline; unfinished threads are detached after the
-        // device is paused, which makes subsequent DRM cleanup observe DeviceInactive.
-        let timeout_ms = hdr_policy.teardown_timeout.as_millis();
-        let deadline = Instant::now() + hdr_policy.teardown_timeout;
-        while !surface_threads.is_empty() && Instant::now() < deadline {
-            let mut index = 0;
-            while index < surface_threads.len() {
-                if surface_threads[index].1.is_finished() {
-                    let (name, thread) = surface_threads.swap_remove(index);
-                    if let Err(err) = thread.join() {
-                        warn!(output = %name, ?err, "surface thread panicked during shutdown");
-                    } else {
-                        info!(output = %name, "surface thread terminated after KMS cleanup");
-                    }
-                } else {
-                    index += 1;
-                }
-            }
-            if !surface_threads.is_empty() {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
+        // Surface threads reset persistent connector state on exit, which needs
+        // an active device, so pause the devices only afterwards. That also
+        // keeps a thread detached after timing out from touching them later.
+        backend::kms::shutdown_surfaces(
+            kms.drm_devices
+                .values_mut()
+                .flat_map(|device| device.inner.surfaces.drain().map(|(_, surface)| surface)),
+        );
         for device in kms.drm_devices.values_mut() {
             device.drm.pause();
-        }
-        for (name, _thread) in surface_threads {
-            warn!(output = %name, timeout_ms, "KMS cleanup timed out; detached surface thread after pausing device");
         }
     }
 
@@ -398,6 +323,35 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         process::exit(code);
     }
 
+    Ok(())
+}
+
+/// Waits for SIGTERM or SIGINT on a dedicated thread and shuts down.
+///
+/// Connector properties such as Colorspace and HDR_OUTPUT_METADATA outlive the
+/// compositor. Surface threads reset them on exit, so they are stopped directly
+/// from here rather than by the main loop, which might be stuck in a callback
+/// until the session manager follows up with SIGKILL.
+fn spawn_signal_thread(signals: SigSet, handle: &LoopHandle<'static, State>) -> Result<()> {
+    let (ping, ping_source) = calloop::ping::make_ping()?;
+    handle
+        .insert_source(ping_source, |(), &mut (), state| {
+            state.common.should_stop = true;
+        })
+        .map_err(|err| err.error)
+        .context("Failed to insert signal source")?;
+
+    std::thread::Builder::new()
+        .name("signal".into())
+        .spawn(move || match signals.wait() {
+            Ok(signal) => {
+                warn!(?signal, "Received termination signal");
+                backend::kms::stop_surface_threads();
+                ping.ping();
+            }
+            Err(err) => error!(?err, "Failed to wait for termination signals"),
+        })
+        .context("Failed to spawn signal thread")?;
     Ok(())
 }
 

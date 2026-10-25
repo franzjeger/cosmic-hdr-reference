@@ -69,7 +69,7 @@ pub mod render;
 mod surface;
 use device::*;
 pub use surface::Timings;
-pub(crate) use surface::{Surface, emergency_shutdown_hdr_surfaces};
+pub(crate) use surface::{Surface, shutdown_surfaces, stop_surface_threads};
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};
 

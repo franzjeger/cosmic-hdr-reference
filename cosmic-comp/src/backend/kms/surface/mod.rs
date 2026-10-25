@@ -93,12 +93,12 @@ use std::{
     collections::{HashMap, HashSet, hash_map},
     mem,
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{Receiver, SyncSender},
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod timings;
@@ -185,10 +185,9 @@ pub struct Surface {
     overlay_plane_formats: Option<FormatSet>,
 
     loop_handle: LoopHandle<'static, State>,
-    thread_command: Sender<ThreadCommand>,
+    thread_command: Arc<Sender<ThreadCommand>>,
     thread_token: RegistrationToken,
-    thread: Option<JoinHandle<()>>,
-    emergency_shutdown_id: Option<u64>,
+    thread: Option<SurfaceThread>,
 
     dpms: bool,
     /// Last adaptive-sync mode sent to the render thread.  The public
@@ -250,42 +249,74 @@ pub struct SurfaceThreadState {
     sequence_delta_plot_name: tracy_client::PlotName,
 }
 
-static HDR_SURFACE_SENDERS: OnceLock<Mutex<HashMap<u64, Sender<ThreadCommand>>>> = OnceLock::new();
-static NEXT_HDR_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
+/// How long the main thread waits for a surface thread, so that one stuck in
+/// the driver cannot hang the compositor.
+const SURFACE_THREAD_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn register_hdr_surface(sender: Sender<ThreadCommand>) -> u64 {
-    let id = NEXT_HDR_SURFACE_ID.fetch_add(1, Ordering::Relaxed);
-    HDR_SURFACE_SENDERS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(id, sender);
-    id
+/// Command channels of the live surface threads, for [`stop_surface_threads`].
+static SURFACE_THREADS: Mutex<Vec<Weak<Sender<ThreadCommand>>>> = Mutex::new(Vec::new());
+
+fn register_surface_thread(sender: &Arc<Sender<ThreadCommand>>) {
+    let mut threads = SURFACE_THREADS.lock().unwrap();
+    threads.retain(|thread| thread.strong_count() > 0);
+    threads.push(Arc::downgrade(sender));
 }
 
-/// Stop strict-HDR surface threads without relying on the compositor's main
-/// event loop. A blocked Wayland/config callback must not prevent connector
-/// color state from being cleared before an external watchdog ends the process.
-pub fn emergency_shutdown_hdr_surfaces() {
-    let senders = HDR_SURFACE_SENDERS
-        .get_or_init(Default::default)
+/// Tells every surface thread to stop, without going through the main loop.
+///
+/// Called on SIGTERM so connector state is reset even if the main loop is
+/// stuck and the process gets SIGKILLed before it reaches its own teardown.
+pub fn stop_surface_threads() {
+    for sender in SURFACE_THREADS
         .lock()
         .unwrap()
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    for sender in senders {
+        .iter()
+        .filter_map(Weak::upgrade)
+    {
         let _ = sender.send(ThreadCommand::End);
     }
 }
 
-/// Receives from a surface-thread channel, bounded by the teardown timeout in
-/// strict HDR mode so a wedged thread cannot hang the compositor forever.
-fn recv_bounded<T>(rx: Receiver<T>) -> Result<T, String> {
-    // A wedged surface thread must never hang the compositor forever,
-    // regardless of session mode.
-    rx.recv_timeout(crate::utils::env::hdr_policy().teardown_timeout)
-        .map_err(|err| err.to_string())
+/// Stops the given surfaces and waits for their threads to exit.
+///
+/// An exiting surface thread drops its compositor, which resets the connector's
+/// persistent Colorspace and HDR_OUTPUT_METADATA as long as the DRM device is
+/// still active. All threads are stopped first and then share one timeout,
+/// after which any that are still running are detached.
+pub fn shutdown_surfaces(surfaces: impl IntoIterator<Item = Surface>) {
+    let threads = surfaces
+        .into_iter()
+        .filter_map(Surface::begin_shutdown)
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + SURFACE_THREAD_TIMEOUT;
+    for thread in threads {
+        thread.join_until(deadline);
+    }
+}
+
+fn recv_bounded<T>(rx: Receiver<T>) -> Result<T, RecvTimeoutError> {
+    rx.recv_timeout(SURFACE_THREAD_TIMEOUT)
+}
+
+#[derive(Debug)]
+struct SurfaceThread {
+    handle: JoinHandle<()>,
+    /// Disconnects once the thread has exited, as `JoinHandle` cannot be
+    /// joined with a timeout.
+    exited: Receiver<()>,
+}
+
+impl SurfaceThread {
+    fn join_until(self, deadline: Instant) {
+        let name = self.handle.thread().name().unwrap().to_string();
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if let Err(RecvTimeoutError::Timeout) = self.exited.recv_timeout(timeout) {
+            warn!("Thread {} did not terminate in time, detaching it.", name);
+            return;
+        }
+        let _ = self.handle.join();
+        info!("Thread {} terminated.", name)
+    }
 }
 
 pub type GbmDrmOutput = DrmOutput<
@@ -379,15 +410,20 @@ impl Surface {
         startup_done: Arc<AtomicBool>,
     ) -> Result<Self> {
         let (tx, rx) = channel::<ThreadCommand>();
+        let thread_command = Arc::new(tx);
+        register_surface_thread(&thread_command);
         let (tx2, rx2) = channel::<SurfaceCommand>();
         let active = Arc::new(AtomicBool::new(false));
 
         let active_clone = active.clone();
         let output_clone = output.clone();
+        let (exited_tx, exited) = std::sync::mpsc::sync_channel(0);
 
-        let thread = std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("surface-{}", output.name()))
             .spawn(move || {
+                // Dropped last, after `surface_thread` has dropped the compositor.
+                let _exited = exited_tx;
                 if let Err(err) = surface_thread(
                     output_clone,
                     primary_node,
@@ -484,11 +520,6 @@ impl Surface {
             })
             .map_err(|_| anyhow::anyhow!("Failed to establish channel to surface thread"))?;
 
-        // Registered unconditionally: connector color state is persistent KMS
-        // state however it was enabled, and the emergency shutdown path must
-        // reach every surface thread even when the main loop is wedged.
-        let emergency_shutdown_id = Some(register_hdr_surface(tx.clone()));
-
         Ok(Surface {
             connector,
             crtc,
@@ -499,10 +530,9 @@ impl Surface {
             primary_plane_formats: FormatSet::default(),
             overlay_plane_formats: None,
             loop_handle: evlh.clone(),
-            thread_command: tx,
+            thread_command,
             thread_token,
-            thread: Some(thread),
-            emergency_shutdown_id,
+            thread: Some(SurfaceThread { handle, exited }),
             dpms: true,
             adaptive_sync_mode: AdaptiveSync::Disabled,
             hdr_enabled: false,
@@ -648,29 +678,8 @@ impl Surface {
         }
     }
 
-    pub fn drop_and_join(mut self) {
-        let thread = self.thread.take();
-        std::mem::drop(self);
-        if let Some(thread) = thread {
-            let name = thread.thread().name().unwrap().to_string();
-            {
-                let deadline =
-                    std::time::Instant::now() + crate::utils::env::hdr_policy().teardown_timeout;
-                while !thread.is_finished() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                if !thread.is_finished() {
-                    warn!(
-                        output = %name,
-                        operation = "drop_and_join",
-                        "surface thread did not stop before the strict HDR deadline; detaching it"
-                    );
-                    return;
-                }
-            }
-            let _ = thread.join();
-            info!("Thread {} terminated.", name)
-        }
+    pub fn drop_and_join(self) {
+        shutdown_surfaces([self]);
     }
 
     fn wait_for_surface_ack(&self, rx: Receiver<()>, operation: &'static str) {
@@ -684,11 +693,8 @@ impl Surface {
         }
     }
 
-    /// Ask the surface thread to stop and return its join handle without waiting.
-    ///
-    /// The compositor owned by that thread is dropped while the DRM device is still
-    /// active, allowing its atomic surface to clear persistent connector color state.
-    pub fn begin_shutdown(mut self) -> Option<JoinHandle<()>> {
+    /// Drops the surface, which tells its thread to stop, without waiting for it.
+    fn begin_shutdown(mut self) -> Option<SurfaceThread> {
         let thread = self.thread.take();
         std::mem::drop(self);
         thread
@@ -697,11 +703,6 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        if let Some(id) = self.emergency_shutdown_id.take()
-            && let Some(senders) = HDR_SURFACE_SENDERS.get()
-        {
-            senders.lock().unwrap().remove(&id);
-        }
         let _ = self.thread_command.send(ThreadCommand::End);
         self.loop_handle.remove(self.thread_token);
         if let Some(thread) = self.thread.take() {
@@ -725,7 +726,41 @@ fn adaptive_sync_update_required(
 
 #[cfg(test)]
 mod tests {
-    use super::{AdaptiveSync, adaptive_sync_update_required};
+    use super::{AdaptiveSync, SurfaceThread, adaptive_sync_update_required};
+    use std::time::{Duration, Instant};
+
+    fn spawn_surface_thread(body: impl FnOnce() + Send + 'static) -> SurfaceThread {
+        let (exited_tx, exited) = std::sync::mpsc::sync_channel(0);
+        let handle = std::thread::Builder::new()
+            .name("surface-test".into())
+            .spawn(move || {
+                let _exited = exited_tx;
+                body();
+            })
+            .unwrap();
+        SurfaceThread { handle, exited }
+    }
+
+    #[test]
+    fn surface_thread_join_is_bounded_by_the_deadline() {
+        let start = Instant::now();
+        spawn_surface_thread(|| std::thread::sleep(Duration::from_millis(50)))
+            .join_until(start + Duration::from_secs(60));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(30));
+
+        // The thread cannot exit before `release` is dropped, so this only
+        // returns if the thread is detached at the deadline.
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let start = Instant::now();
+        spawn_surface_thread(move || {
+            let _ = blocked.recv();
+        })
+        .join_until(start + Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(30));
+        drop(release);
+    }
 
     #[test]
     fn adaptive_sync_updates_follow_the_render_thread_state() {
