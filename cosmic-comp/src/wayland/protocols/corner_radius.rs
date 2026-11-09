@@ -657,10 +657,6 @@ fn pad_rect(
 fn layer_radius_hook<D: 'static>(_state: &mut D, _dh: &DisplayHandle, surface: &WlSurface) {
     let bbox = bbox_from_surface_tree(surface, Point::default());
     with_states(surface, |surface_data| {
-        let corners = *surface_data
-            .cached_state
-            .get::<CacheableCorners>()
-            .pending();
         let padding = *surface_data
             .cached_state
             .get::<CacheablePadding>()
@@ -681,24 +677,10 @@ fn layer_radius_hook<D: 'static>(_state: &mut D, _dh: &DisplayHandle, surface: &
             return;
         };
 
-        if corners.0.as_ref().is_some_and(|corners| {
-            let half_min_dim = (padded_box.size.w.min(padded_box.size.h) / 2) as u32;
-            corners.top_right > half_min_dim
-                || corners.top_left > half_min_dim
-                || corners.bottom_right > half_min_dim
-                || corners.bottom_left > half_min_dim
-        }) && let Some(hook) = surface_data.data_map.get::<LayerHookId>()
-        {
-            let hook_ref = hook.lock().unwrap();
-            if let Some((_, obj)) = hook_ref.as_ref()
-                && let Ok(obj) = obj.upgrade()
-            {
-                obj.post_error(
-                    cosmic_corner_radius_layer_v1::Error::RadiusTooLarge as u32,
-                    format!("{obj:?} corner radius too large"),
-                );
-            }
-        }
+        // libcosmic may commit themed corners before the layer receives its
+        // final configure. Do not turn that transient cosmetic state into a
+        // fatal Wayland protocol error that disconnects the portal.
+        let _ = padded_box;
     });
 }
 
