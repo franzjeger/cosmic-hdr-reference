@@ -23,6 +23,9 @@ and reuse the implementation while it is split into reviewable changes.
 - Wayland color-management image descriptions and HDR client detection.
 - Fullscreen/borderless Windows HDR client presentation using the scRGB
   reference-white convention used by Wine/Proton.
+- Windowed HDR client composition (PQ and Windows-scRGB, including rounded
+  windows) into a half-float extended-range intermediate; see
+  `docs/windowed-hdr-composition.md`.
 - Tearing-control protocol support, asynchronous KMS page flips, and an
   uncapped presentation path for clients that request tearing.
 - Live VRR mode propagation. `Automatic` is the recommended desktop policy;
@@ -32,7 +35,7 @@ and reuse the implementation while it is split into reviewable changes.
 - Stable HDR post-process element identity, preventing cursor movement from
   invalidating the whole output on every frame.
 
-The COSMIC workspace currently passes all 20 unit and integration tests.
+The COSMIC workspace currently passes all 36 unit and integration tests.
 
 ## Validated hardware
 
@@ -70,24 +73,21 @@ not reproduced by the maintainer.
 
 ## Current architecture and limitations
 
-The compositor renders the ordinary SDR desktop into an 8-bit intermediate,
-then performs the final SDR-to-BT.2020/PQ conversion into a 10-bit scanout
-buffer. Native HDR client content can bypass that SDR mapping when it covers
-the output and carries a compatible image description.
-
-This proves the KMS, protocol, configuration, client-passthrough, and UX paths,
-but it is not the desired long-term color architecture. A production design
-should composite all surfaces in a linear, high-precision intermediate (for
-example F16), apply per-surface color transforms and tone mapping there, and
-encode only at the output boundary.
+Outside fullscreen passthrough, HDR outputs composite into an extended-range
+half-float (`ABGR16161616F`) intermediate in the desktop's SDR encoding
+(Rec.709, policy SDR transfer, `1.0` at reference white, extended by odd
+symmetry) when supported on the scanout GPU, and encode to BT.2020/PQ at the
+output boundary. Windowed HDR clients (PQ and Windows-scRGB, including
+rounded-corner windows) are decoded into that extended-range space by
+`hdr_content.frag` so highlights above reference white and wide-gamut colors
+survive until the final PQ encode (resolving
+[#1](https://github.com/franzjeger/cosmic-hdr-reference/issues/1); see
+`docs/windowed-hdr-composition.md`). Native HDR client content that covers the
+output can still use the fullscreen passthrough path.
 
 Direct and overlay scanout are disabled while the desktop HDR post-process is
 active because those planes would bypass the shader. HDR client passthrough
 can re-enable eligible primary-plane scanout.
-
-Because of this, HDR clients that do not cover the output, such as a windowed
-Blender using a Windows-scRGB swapchain, are currently composited as SDR; see
-[#1](https://github.com/franzjeger/cosmic-hdr-reference/issues/1).
 
 ## Client notes
 

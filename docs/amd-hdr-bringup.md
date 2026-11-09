@@ -22,16 +22,18 @@ compositor process stayed alive rather than returning a useful startup error.
    to acquire the same lock. The render thread self-deadlocked and produced a
    permanent black session.
 
-## Prototype fix
+## Fix
 
-`patches/cosmic-comp-amd-hdr-startup.patch` contains the focused compositor
-changes. The strict failure paths release the compositor reference and avoid
-running the partially initialized compositor's re-entrant `Drop` path.
+`patches/cosmic-comp-amd-hdr-startup.patch` contains the focused compositor and
+Smithay changes. `LockedDrmOutputManager::remove_output` removes the CRTC's
+`DrmCompositor` directly through the already-held write guard and marks the
+`DrmOutput` as removed so its `Drop` implementation does not re-lock the
+compositor map. The strict failure paths release `compositor_ref` and call
+`drm.remove_output(compositor)` before returning the error.
 
-Using `mem::forget` is deliberately scoped to fatal startup failure and is a
-prototype safety measure, not the preferred upstream architecture. A permanent
-fix should move error propagation and compositor teardown outside `KmsGuard`,
-after all KMS and compositor guards have been released.
+The session watchdog was also changed to fail closed: failed live HDR
+validation requests a clean compositor shutdown and terminates the logind
+session if the compositor does not exit within ten seconds.
 
 ## Scope
 

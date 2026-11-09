@@ -44,7 +44,7 @@ index 6b3a025..b9864f6 100644
 -                                                ));
 +                                                );
 +                                                std::mem::drop(compositor_ref);
-+                                                std::mem::forget(compositor);
++                                                drm.remove_output(compositor);
 +                                                return Err(failure);
                                              }
                                              warn!(
@@ -60,8 +60,52 @@ index 6b3a025..b9864f6 100644
 -                                        ));
 +                                        );
 +                                        std::mem::drop(compositor_ref);
-+                                        std::mem::forget(compositor);
++                                        drm.remove_output(compositor);
 +                                        return Err(failure);
                                      }
                                      warn!(
                                          output = %surface.output.name(),
+diff --git a/smithay/src/backend/drm/output.rs b/smithay/src/backend/drm/output.rs
+index c19163b..6b7ee55 100644
+--- a/smithay/src/backend/drm/output.rs
++++ b/smithay/src/backend/drm/output.rs
+@@ -489,11 +489,19 @@ where
+         Ok(DrmOutput {
+             compositor: self.compositor_arc.clone(),
+             crtc,
++            removed: false,
+             allocator: self.allocator.clone(),
+             renderer_formats: Vec::from(self.renderer_formats),
+         })
+     }
+ 
++    /// Removes an initialized [`DrmOutput`] while this [`LockedDrmOutputManager`] holds
++    /// the compositor write lock, dropping its [`DrmCompositor`] without re-locking.
++    pub fn remove_output(&mut self, mut output: DrmOutput<A, F, U, G>) {
++        output.removed = true;
++        self.compositor.remove(&output.crtc);
++    }
++
+     /// Grants exclusive access to all underlying [`DrmCompositor`]s.
+     pub fn compositors(&mut self) -> &HashMap<crtc::Handle, Mutex<DrmCompositor<A, F, U, G>>> {
+         &self.compositor
+@@ -621,6 +629,7 @@ where
+ {
+     compositor: CompositorList<A, F, U, G>,
+     crtc: crtc::Handle,
++    removed: bool,
+     allocator: A,
+     renderer_formats: Vec<DrmFormat>,
+ }
+@@ -808,8 +817,10 @@ where
+     G: AsFd + 'static,
+ {
+     fn drop(&mut self) {
+-        let mut write_guard = self.compositor.write().unwrap();
+-        write_guard.remove(&self.crtc);
++        if !self.removed {
++            let mut write_guard = self.compositor.write().unwrap();
++            write_guard.remove(&self.crtc);
++        }
+     }
+ }

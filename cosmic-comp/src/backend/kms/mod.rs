@@ -1337,7 +1337,7 @@ impl KmsGuard<'_> {
                                                     surface.output.name()
                                                 );
                                                 std::mem::drop(compositor_ref);
-                                                std::mem::forget(compositor);
+                                                drm.remove_output(compositor);
                                                 return Err(failure);
                                             }
                                             warn!(
@@ -1355,7 +1355,7 @@ impl KmsGuard<'_> {
                                             surface.output.name()
                                         );
                                         std::mem::drop(compositor_ref);
-                                        std::mem::forget(compositor);
+                                        drm.remove_output(compositor);
                                         return Err(failure);
                                     }
                                     warn!(

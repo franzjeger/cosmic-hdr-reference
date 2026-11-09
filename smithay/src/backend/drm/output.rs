@@ -489,9 +489,17 @@ where
         Ok(DrmOutput {
             compositor: self.compositor_arc.clone(),
             crtc,
+            removed: false,
             allocator: self.allocator.clone(),
             renderer_formats: Vec::from(self.renderer_formats),
         })
+    }
+
+    /// Removes an initialized [`DrmOutput`] while this [`LockedDrmOutputManager`] holds
+    /// the compositor write lock, dropping its [`DrmCompositor`] without re-locking.
+    pub fn remove_output(&mut self, mut output: DrmOutput<A, F, U, G>) {
+        output.removed = true;
+        self.compositor.remove(&output.crtc);
     }
 
     /// Grants exclusive access to all underlying [`DrmCompositor`]s.
@@ -621,6 +629,7 @@ where
 {
     compositor: CompositorList<A, F, U, G>,
     crtc: crtc::Handle,
+    removed: bool,
     allocator: A,
     renderer_formats: Vec<DrmFormat>,
 }
@@ -808,8 +817,10 @@ where
     G: AsFd + 'static,
 {
     fn drop(&mut self) {
-        let mut write_guard = self.compositor.write().unwrap();
-        write_guard.remove(&self.crtc);
+        if !self.removed {
+            let mut write_guard = self.compositor.write().unwrap();
+            write_guard.remove(&self.crtc);
+        }
     }
 }
 
